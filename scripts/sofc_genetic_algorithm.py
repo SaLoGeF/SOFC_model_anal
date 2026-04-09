@@ -7,9 +7,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, VotingRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import FunctionTransformer, PolynomialFeatures
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -43,19 +47,21 @@ GA_MUTATION_SCALE = 0.08      # σ мутации как доля диапазо
 GA_SEED = 42
 
 # --- Параметры суррогатных ML-моделей ---------------------------------------
-ML_TEST_SIZE = 0.2            # доля тестовой выборки
+ML_TEST_SIZE = 0.2            # доля тестовой выборки (for accuracy plot)
+ML_CV_FOLDS = 5               # кросс-валидация для метрик
+ML_POLY_DEGREE = 2            # степень полиномиального расширения признаков
 
 # P76: ансамбль RF + GBR (VotingRegressor)
-ML_P76_RF_N_ESTIMATORS = 1000
-ML_P76_RF_MIN_SAMPLES_LEAF = 3
-ML_P76_GBR_N_ESTIMATORS = 1000
-ML_P76_GBR_MAX_DEPTH = 6
-ML_P76_GBR_LEARNING_RATE = 0.05
+ML_P76_RF_N_ESTIMATORS = 1500
+ML_P76_RF_MIN_SAMPLES_LEAF = 2
+ML_P76_GBR_N_ESTIMATORS = 2000
+ML_P76_GBR_MAX_DEPTH = 8
+ML_P76_GBR_LEARNING_RATE = 0.03
 ML_P76_GBR_SUBSAMPLE = 0.8
-ML_P76_VOTING_WEIGHTS = [2, 1]  # [RF, GBR]
+ML_P76_VOTING_WEIGHTS = [1, 2]  # [RF, GBR]
 
 # P62, P79, P89: RandomForest
-ML_RF_N_ESTIMATORS = 400
+ML_RF_N_ESTIMATORS = 800
 ML_RF_MIN_SAMPLES_LEAF = 1
 
 # ---------------------------------------------------------------------------
@@ -83,6 +89,12 @@ OBJECTIVE_WEIGHTS = {
 }
 
 # ===========================================================================
+
+
+def _add_reciprocal_p27(X: np.ndarray) -> np.ndarray:
+    """Append 1/P27 (first column) — captures exponential P76 growth at low P27."""
+    reciprocal = 1.0 / np.clip(X[:, 0], 0.01, None)
+    return np.column_stack([X, reciprocal])
 
 
 @dataclass
@@ -240,10 +252,10 @@ def mutate(
 
 def evaluate_genes(
     genes: np.ndarray,
-    current_model: VotingRegressor,
-    loss_model: RandomForestRegressor,
-    fuel_out_model: RandomForestRegressor,
-    efficiency_model: RandomForestRegressor,
+    current_model: BaseEstimator,
+    loss_model: BaseEstimator,
+    fuel_out_model: BaseEstimator,
+    efficiency_model: BaseEstimator,
 ) -> Individual:
     row = genes.reshape(1, -1)
     return Individual(
@@ -260,10 +272,10 @@ def initialize_population(
     bounds: np.ndarray,
     seed_points: np.ndarray,
     rng: np.random.Generator,
-    current_model: VotingRegressor,
-    loss_model: RandomForestRegressor,
-    fuel_out_model: RandomForestRegressor,
-    efficiency_model: RandomForestRegressor,
+    current_model: BaseEstimator,
+    loss_model: BaseEstimator,
+    fuel_out_model: BaseEstimator,
+    efficiency_model: BaseEstimator,
 ) -> list[Individual]:
     population: list[Individual] = []
     shuffled_indices = rng.permutation(len(seed_points))
@@ -280,10 +292,10 @@ def initialize_population(
 
 
 def evolve_population(
-    current_model: VotingRegressor,
-    loss_model: RandomForestRegressor,
-    fuel_out_model: RandomForestRegressor,
-    efficiency_model: RandomForestRegressor,
+    current_model: BaseEstimator,
+    loss_model: BaseEstimator,
+    fuel_out_model: BaseEstimator,
+    efficiency_model: BaseEstimator,
     bounds: np.ndarray,
     seed_points: np.ndarray,
     population_size: int,
@@ -413,7 +425,7 @@ def train_surrogate_models(
     dataset: pd.DataFrame,
     feature_columns: list[str],
     random_state: int,
-) -> tuple[VotingRegressor, RandomForestRegressor, RandomForestRegressor, RandomForestRegressor, dict[str, float], pd.DataFrame]:
+) -> tuple[BaseEstimator, BaseEstimator, BaseEstimator, BaseEstimator, dict[str, float], pd.DataFrame]:
     features = dataset[feature_columns].to_numpy(dtype=float)
     # Clip tiny negative P76 values (numerical noise near zero OCV point)
     current_target = np.clip(dataset[CURRENT_TARGET].to_numpy(dtype=float), 0.0, None)
@@ -421,67 +433,63 @@ def train_surrogate_models(
     fuel_out_target = dataset[FUEL_OUT_TARGET].to_numpy(dtype=float)
     efficiency_target = dataset[EFFICIENCY_TARGET].to_numpy(dtype=float)
 
-    split = train_test_split(
-        features,
-        current_target,
-        loss_target,
-        fuel_out_target,
-        efficiency_target,
-        test_size=ML_TEST_SIZE,
-        random_state=random_state,
-    )
-    x_train, x_test = split[0], split[1]
-    current_train, current_test = split[2], split[3]
-    loss_train, loss_test = split[4], split[5]
-    fuel_out_train, fuel_out_test = split[6], split[7]
-    efficiency_train, efficiency_test = split[8], split[9]
-
     rf_params: dict = dict(n_estimators=ML_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_RF_MIN_SAMPLES_LEAF)
+    reciprocal = FunctionTransformer(_add_reciprocal_p27)
 
-    # P76: ensemble of RF + GBR reduces MAE on extreme points while keeping R2 high
-    current_model = VotingRegressor(
-        estimators=[
-            ("rf", RandomForestRegressor(n_estimators=ML_P76_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_P76_RF_MIN_SAMPLES_LEAF)),
-            ("gbr", GradientBoostingRegressor(n_estimators=ML_P76_GBR_N_ESTIMATORS, max_depth=ML_P76_GBR_MAX_DEPTH, learning_rate=ML_P76_GBR_LEARNING_RATE, random_state=random_state, subsample=ML_P76_GBR_SUBSAMPLE)),
-        ],
-        weights=ML_P76_VOTING_WEIGHTS,
+    # P76: Pipeline(1/P27 → PolyFeatures → VotingRegressor) + log1p target transform
+    # log1p нормализует огромный диапазон P76 (0 … 21 000), делая обучение стабильнее
+    current_model = TransformedTargetRegressor(
+        regressor=make_pipeline(
+            FunctionTransformer(_add_reciprocal_p27),
+            PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False),
+            VotingRegressor(
+                estimators=[
+                    ("rf", RandomForestRegressor(n_estimators=ML_P76_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_P76_RF_MIN_SAMPLES_LEAF)),
+                    ("gbr", GradientBoostingRegressor(n_estimators=ML_P76_GBR_N_ESTIMATORS, max_depth=ML_P76_GBR_MAX_DEPTH, learning_rate=ML_P76_GBR_LEARNING_RATE, random_state=random_state, subsample=ML_P76_GBR_SUBSAMPLE)),
+                ],
+                weights=ML_P76_VOTING_WEIGHTS,
+            ),
+        ),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    loss_model = RandomForestRegressor(**rf_params)
-    fuel_out_model = RandomForestRegressor(**rf_params)
-    efficiency_model = RandomForestRegressor(**rf_params)
 
-    current_model.fit(x_train, current_train)
-    loss_model.fit(x_train, loss_train)
-    fuel_out_model.fit(x_train, fuel_out_train)
-    efficiency_model.fit(x_train, efficiency_train)
+    # P62, P79, P89: Pipeline(1/P27 → PolyFeatures → RandomForest)
+    loss_model = make_pipeline(FunctionTransformer(_add_reciprocal_p27), PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False), RandomForestRegressor(**rf_params))
+    fuel_out_model = make_pipeline(FunctionTransformer(_add_reciprocal_p27), PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False), RandomForestRegressor(**rf_params))
+    efficiency_model = make_pipeline(FunctionTransformer(_add_reciprocal_p27), PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False), RandomForestRegressor(**rf_params))
 
-    current_pred = current_model.predict(x_test)
-    loss_pred = loss_model.predict(x_test)
-    fuel_out_pred = fuel_out_model.predict(x_test)
-    efficiency_pred = efficiency_model.predict(x_test)
+    # Кросс-валидация: каждая точка предсказывается моделью, не видевшей её — стабильнее для 197 строк
+    cv = KFold(n_splits=ML_CV_FOLDS, shuffle=True, random_state=random_state)
+    current_pred_cv = cross_val_predict(current_model, features, current_target, cv=cv)
+    loss_pred_cv = cross_val_predict(loss_model, features, loss_target, cv=cv)
+    fuel_out_pred_cv = cross_val_predict(fuel_out_model, features, fuel_out_target, cv=cv)
+    efficiency_pred_cv = cross_val_predict(efficiency_model, features, efficiency_target, cv=cv)
+
     metrics = {
-        "current_r2": r2_score(current_test, current_pred),
-        "current_mae": mean_absolute_error(current_test, current_pred),
-        "loss_r2": r2_score(loss_test, loss_pred),
-        "loss_mae": mean_absolute_error(loss_test, loss_pred),
-        "fuel_out_r2": r2_score(fuel_out_test, fuel_out_pred),
-        "fuel_out_mae": mean_absolute_error(fuel_out_test, fuel_out_pred),
-        "efficiency_r2": r2_score(efficiency_test, efficiency_pred),
-        "efficiency_mae": mean_absolute_error(efficiency_test, efficiency_pred),
+        "current_r2": r2_score(current_target, current_pred_cv),
+        "current_mae": mean_absolute_error(current_target, current_pred_cv),
+        "loss_r2": r2_score(loss_target, loss_pred_cv),
+        "loss_mae": mean_absolute_error(loss_target, loss_pred_cv),
+        "fuel_out_r2": r2_score(fuel_out_target, fuel_out_pred_cv),
+        "fuel_out_mae": mean_absolute_error(fuel_out_target, fuel_out_pred_cv),
+        "efficiency_r2": r2_score(efficiency_target, efficiency_pred_cv),
+        "efficiency_mae": mean_absolute_error(efficiency_target, efficiency_pred_cv),
     }
     accuracy_frame = pd.DataFrame(
         {
-            "actual_P76": current_test,
-            "predicted_P76": current_pred,
-            "actual_P62": loss_test,
-            "predicted_P62": loss_pred,
-            "actual_P79": fuel_out_test,
-            "predicted_P79": fuel_out_pred,
-            "actual_P89": efficiency_test,
-            "predicted_P89": efficiency_pred,
+            "actual_P76": current_target,
+            "predicted_P76": current_pred_cv,
+            "actual_P62": loss_target,
+            "predicted_P62": loss_pred_cv,
+            "actual_P79": fuel_out_target,
+            "predicted_P79": fuel_out_pred_cv,
+            "actual_P89": efficiency_target,
+            "predicted_P89": efficiency_pred_cv,
         }
     )
 
+    # Финальное обучение на всех данных для использования в ГА
     current_model.fit(features, current_target)
     loss_model.fit(features, loss_target)
     fuel_out_model.fit(features, fuel_out_target)
