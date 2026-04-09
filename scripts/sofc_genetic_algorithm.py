@@ -13,27 +13,76 @@ from sklearn.model_selection import train_test_split
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+
+# ===========================================================================
+#                       НАСТРОЙКИ — ВСЁ В ОДНОМ МЕСТЕ
+# ===========================================================================
+
+# --- Пути по умолчанию ------------------------------------------------------
 DEFAULT_DATASET = ROOT_DIR / "combined_sofc_dataset.csv"
 DEFAULT_OUTPUT = ROOT_DIR / "ga_best_solution.csv"
 DEFAULT_HISTORY_OUTPUT = ROOT_DIR / "ga_convergence_history.csv"
 DEFAULT_CONVERGENCE_FIGURE = ROOT_DIR / "ga_convergence.png"
 DEFAULT_ACCURACY_FIGURE = ROOT_DIR / "ga_model_accuracy.png"
+
+# --- Входные / целевые переменные -------------------------------------------
 FEATURE_COLUMNS = ["P27", "P46", "P47", "P52"]
-CURRENT_TARGET = "P76"
-LOSS_TARGET = "P62"
-FUEL_OUT_TARGET = "P79"
-EFFICIENCY_TARGET = "P89"
+
+CURRENT_TARGET = "P76"     # Плотность тока (maximize)
+LOSS_TARGET = "P62"        # Суммарные потери (minimize)
+FUEL_OUT_TARGET = "P79"    # Выход H2 на выходе (minimize)
+EFFICIENCY_TARGET = "P89"  # КПД (maximize)
 ALL_TARGETS = [CURRENT_TARGET, LOSS_TARGET, FUEL_OUT_TARGET, EFFICIENCY_TARGET]
 
-# Weights for compromise distance-to-ideal selection.
-# P76 (current-density) and P89 (efficiency) are primary performance metrics.
-# P62 (total-losses) and P79 (fuel-out-h2) are secondary.
+# --- Параметры генетического алгоритма --------------------------------------
+GA_POPULATION_SIZE = 40
+GA_GENERATIONS = 20
+GA_CROSSOVER_RATE = 0.9
+GA_MUTATION_RATE = 0.25       # вероятность мутации каждого гена
+GA_MUTATION_SCALE = 0.08      # σ мутации как доля диапазона признака
+GA_SEED = 42
+
+# --- Параметры суррогатных ML-моделей ---------------------------------------
+ML_TEST_SIZE = 0.2            # доля тестовой выборки
+
+# P76: ансамбль RF + GBR (VotingRegressor)
+ML_P76_RF_N_ESTIMATORS = 1000
+ML_P76_RF_MIN_SAMPLES_LEAF = 3
+ML_P76_GBR_N_ESTIMATORS = 1000
+ML_P76_GBR_MAX_DEPTH = 6
+ML_P76_GBR_LEARNING_RATE = 0.05
+ML_P76_GBR_SUBSAMPLE = 0.8
+ML_P76_VOTING_WEIGHTS = [2, 1]  # [RF, GBR]
+
+# P62, P79, P89: RandomForest
+ML_RF_N_ESTIMATORS = 400
+ML_RF_MIN_SAMPLES_LEAF = 1
+
+# ---------------------------------------------------------------------------
+# Fitness-функция (взвешенное расстояние до идеальной точки):
+#
+#   fitness(x) = sqrt( w_P76 * (1 - s_P76)^2
+#                    + w_P62 * (1 - s_P62)^2
+#                    # + w_P79 * (1 - s_P79)^2   ← отключён (вес = 0)
+#                    + w_P89 * (1 - s_P89)^2 )
+#
+# где нормализованные score-ы:
+#   s_P76 = (P76 - P76_min) / (P76_max - P76_min)   # maximize → чем больше, тем лучше
+#   s_P62 = (P62_max - P62) / (P62_max - P62_min)   # minimize → инвертировано
+#   s_P79 = (P79_max - P79) / (P79_max - P79_min)   # minimize → отключён (вес = 0)
+#   s_P89 = (P89 - P89_min) / (P89_max - P89_min)   # maximize → чем больше, тем лучше
+#
+# Идеальная точка: s_i = 1 для всех целей.
+# Меньшее значение fitness → лучшее решение (ближе к идеалу).
+# ---------------------------------------------------------------------------
 OBJECTIVE_WEIGHTS = {
-    CURRENT_TARGET: 0.4,
-    LOSS_TARGET: 0.2,
-    FUEL_OUT_TARGET: 0.2,
-    EFFICIENCY_TARGET: 0.3,
+    CURRENT_TARGET: 0.4,   # основной
+    LOSS_TARGET: 0.2,      # вторичный
+    FUEL_OUT_TARGET: 0.0,  # отключён
+    EFFICIENCY_TARGET: 0.3,  # основной
 }
+
+# ===========================================================================
 
 
 @dataclass
@@ -378,7 +427,7 @@ def train_surrogate_models(
         loss_target,
         fuel_out_target,
         efficiency_target,
-        test_size=0.2,
+        test_size=ML_TEST_SIZE,
         random_state=random_state,
     )
     x_train, x_test = split[0], split[1]
@@ -387,15 +436,15 @@ def train_surrogate_models(
     fuel_out_train, fuel_out_test = split[6], split[7]
     efficiency_train, efficiency_test = split[8], split[9]
 
-    rf_params: dict = dict(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
+    rf_params: dict = dict(n_estimators=ML_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_RF_MIN_SAMPLES_LEAF)
 
     # P76: ensemble of RF + GBR reduces MAE on extreme points while keeping R2 high
     current_model = VotingRegressor(
         estimators=[
-            ("rf", RandomForestRegressor(n_estimators=1000, random_state=random_state, n_jobs=-1, min_samples_leaf=3)),
-            ("gbr", GradientBoostingRegressor(n_estimators=1000, max_depth=6, learning_rate=0.05, random_state=random_state, subsample=0.8)),
+            ("rf", RandomForestRegressor(n_estimators=ML_P76_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_P76_RF_MIN_SAMPLES_LEAF)),
+            ("gbr", GradientBoostingRegressor(n_estimators=ML_P76_GBR_N_ESTIMATORS, max_depth=ML_P76_GBR_MAX_DEPTH, learning_rate=ML_P76_GBR_LEARNING_RATE, random_state=random_state, subsample=ML_P76_GBR_SUBSAMPLE)),
         ],
-        weights=[2, 1],
+        weights=ML_P76_VOTING_WEIGHTS,
     )
     loss_model = RandomForestRegressor(**rf_params)
     fuel_out_model = RandomForestRegressor(**rf_params)
@@ -757,24 +806,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--population-size",
         type=int,
-        default=40,
+        default=GA_POPULATION_SIZE,
         help="GA population size. Increase it for a deeper search.",
     )
     parser.add_argument(
         "--generations",
         type=int,
-        default=20,
+        default=GA_GENERATIONS,
         help="Number of GA generations. Increase it for a deeper search.",
     )
-    parser.add_argument("--crossover-rate", type=float, default=0.9, help="Crossover rate.")
-    parser.add_argument("--mutation-rate", type=float, default=0.25, help="Per-gene mutation rate.")
+    parser.add_argument("--crossover-rate", type=float, default=GA_CROSSOVER_RATE, help="Crossover rate.")
+    parser.add_argument("--mutation-rate", type=float, default=GA_MUTATION_RATE, help="Per-gene mutation rate.")
     parser.add_argument(
         "--mutation-scale",
         type=float,
-        default=0.08,
+        default=GA_MUTATION_SCALE,
         help="Mutation sigma as a fraction of each feature range.",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=GA_SEED, help="Random seed.")
     return parser.parse_args()
 
 
