@@ -21,6 +21,19 @@ DEFAULT_ACCURACY_FIGURE = ROOT_DIR / "ga_model_accuracy.png"
 FEATURE_COLUMNS = ["P27", "P46", "P47", "P52"]
 CURRENT_TARGET = "P76"
 LOSS_TARGET = "P62"
+FUEL_OUT_TARGET = "P79"
+EFFICIENCY_TARGET = "P89"
+ALL_TARGETS = [CURRENT_TARGET, LOSS_TARGET, FUEL_OUT_TARGET, EFFICIENCY_TARGET]
+
+# Weights for compromise distance-to-ideal selection.
+# P76 (current-density) and P89 (efficiency) are primary performance metrics.
+# P62 (total-losses) and P79 (fuel-out-h2) are secondary.
+OBJECTIVE_WEIGHTS = {
+    CURRENT_TARGET: 0.3,
+    LOSS_TARGET: 0.2,
+    FUEL_OUT_TARGET: 0.2,
+    EFFICIENCY_TARGET: 0.3,
+}
 
 
 @dataclass
@@ -28,6 +41,8 @@ class Individual:
     genes: np.ndarray
     predicted_current: float
     predicted_losses: float
+    predicted_fuel_out: float
+    predicted_efficiency: float
     rank: int = 0
     crowding: float = 0.0
 
@@ -36,6 +51,8 @@ class Individual:
             genes=self.genes.copy(),
             predicted_current=self.predicted_current,
             predicted_losses=self.predicted_losses,
+            predicted_fuel_out=self.predicted_fuel_out,
+            predicted_efficiency=self.predicted_efficiency,
             rank=self.rank,
             crowding=self.crowding,
         )
@@ -49,13 +66,18 @@ def resolve_path(path_value: Path | str, base_dir: Path) -> Path:
 
 
 def dominates(left: Individual, right: Individual) -> bool:
+    # P76 maximize, P62 minimize, P79 minimize, P89 maximize
     no_worse = (
         left.predicted_current >= right.predicted_current
         and left.predicted_losses <= right.predicted_losses
+        and left.predicted_fuel_out <= right.predicted_fuel_out
+        and left.predicted_efficiency >= right.predicted_efficiency
     )
     strictly_better = (
         left.predicted_current > right.predicted_current
         or left.predicted_losses < right.predicted_losses
+        or left.predicted_fuel_out < right.predicted_fuel_out
+        or left.predicted_efficiency > right.predicted_efficiency
     )
     return no_worse and strictly_better
 
@@ -104,7 +126,7 @@ def assign_crowding_distance(front: list[Individual]) -> None:
     for individual in front:
         individual.crowding = 0.0
 
-    objectives = ["predicted_current", "predicted_losses"]
+    objectives = ["predicted_current", "predicted_losses", "predicted_fuel_out", "predicted_efficiency"]
     for objective in objectives:
         front.sort(key=lambda individual: getattr(individual, objective))
         front[0].crowding = float("inf")
@@ -121,7 +143,8 @@ def assign_crowding_distance(front: list[Individual]) -> None:
 
 
 def tournament_select(population: list[Individual], rng: np.random.Generator) -> Individual:
-    first, second = rng.choice(population, size=2, replace=False)
+    indices = rng.choice(len(population), size=2, replace=False)
+    first, second = population[indices[0]], population[indices[1]]
     if first.rank != second.rank:
         return first if first.rank < second.rank else second
     if first.crowding != second.crowding:
@@ -170,13 +193,16 @@ def evaluate_genes(
     genes: np.ndarray,
     current_model: RandomForestRegressor,
     loss_model: RandomForestRegressor,
+    fuel_out_model: RandomForestRegressor,
+    efficiency_model: RandomForestRegressor,
 ) -> Individual:
-    current_prediction = float(current_model.predict(genes.reshape(1, -1))[0])
-    loss_prediction = float(loss_model.predict(genes.reshape(1, -1))[0])
+    row = genes.reshape(1, -1)
     return Individual(
         genes=genes,
-        predicted_current=current_prediction,
-        predicted_losses=loss_prediction,
+        predicted_current=float(current_model.predict(row)[0]),
+        predicted_losses=float(loss_model.predict(row)[0]),
+        predicted_fuel_out=float(fuel_out_model.predict(row)[0]),
+        predicted_efficiency=float(efficiency_model.predict(row)[0]),
     )
 
 
@@ -187,17 +213,19 @@ def initialize_population(
     rng: np.random.Generator,
     current_model: RandomForestRegressor,
     loss_model: RandomForestRegressor,
+    fuel_out_model: RandomForestRegressor,
+    efficiency_model: RandomForestRegressor,
 ) -> list[Individual]:
     population: list[Individual] = []
     shuffled_indices = rng.permutation(len(seed_points))
     seed_count = min(len(seed_points), population_size // 2)
 
     for index in shuffled_indices[:seed_count]:
-        population.append(evaluate_genes(seed_points[index].copy(), current_model, loss_model))
+        population.append(evaluate_genes(seed_points[index].copy(), current_model, loss_model, fuel_out_model, efficiency_model))
 
     while len(population) < population_size:
         genes = rng.uniform(bounds[:, 0], bounds[:, 1])
-        population.append(evaluate_genes(genes, current_model, loss_model))
+        population.append(evaluate_genes(genes, current_model, loss_model, fuel_out_model, efficiency_model))
 
     return population
 
@@ -205,6 +233,8 @@ def initialize_population(
 def evolve_population(
     current_model: RandomForestRegressor,
     loss_model: RandomForestRegressor,
+    fuel_out_model: RandomForestRegressor,
+    efficiency_model: RandomForestRegressor,
     bounds: np.ndarray,
     seed_points: np.ndarray,
     population_size: int,
@@ -221,6 +251,8 @@ def evolve_population(
         rng=rng,
         current_model=current_model,
         loss_model=loss_model,
+        fuel_out_model=fuel_out_model,
+        efficiency_model=efficiency_model,
     )
 
     fronts = fast_non_dominated_sort(population)
@@ -235,6 +267,8 @@ def evolve_population(
             "best_so_far_distance_to_ideal": best_distance_so_far,
             "best_so_far_P76": best_candidate.predicted_current,
             "best_so_far_P62": best_candidate.predicted_losses,
+            "best_so_far_P79": best_candidate.predicted_fuel_out,
+            "best_so_far_P89": best_candidate.predicted_efficiency,
         }
     ]
 
@@ -270,9 +304,9 @@ def evolve_population(
                 mutation_rate=mutation_rate,
                 mutation_scale=mutation_scale,
             )
-            offspring.append(evaluate_genes(child_a_genes, current_model, loss_model))
+            offspring.append(evaluate_genes(child_a_genes, current_model, loss_model, fuel_out_model, efficiency_model))
             if len(offspring) < population_size:
-                offspring.append(evaluate_genes(child_b_genes, current_model, loss_model))
+                offspring.append(evaluate_genes(child_b_genes, current_model, loss_model, fuel_out_model, efficiency_model))
 
         combined = population + offspring
         combined_fronts = fast_non_dominated_sort(combined)
@@ -304,16 +338,20 @@ def evolve_population(
             "best_so_far_distance_to_ideal": best_distance_so_far,
             "best_so_far_P76": best_candidate.predicted_current,
             "best_so_far_P62": best_candidate.predicted_losses,
+            "best_so_far_P79": best_candidate.predicted_fuel_out,
+            "best_so_far_P89": best_candidate.predicted_efficiency,
         }
         history_rows.append(summary)
 
         if generation == 1 or generation % progress_interval == 0 or generation == generations:
             print(
                 f"Generation {generation:>3}: front_size={int(summary['front_size'])}, "
-                f"current_distance={summary['best_distance_to_ideal']:.4f}, "
-                f"best_so_far_distance={summary['best_so_far_distance_to_ideal']:.4f}, "
-                f"best_so_far_P76={summary['best_so_far_P76']:.4f}, "
-                f"best_so_far_P62={summary['best_so_far_P62']:.4f}"
+                f"distance={summary['best_distance_to_ideal']:.4f}, "
+                f"best_dist={summary['best_so_far_distance_to_ideal']:.4f}, "
+                f"P76={summary['best_so_far_P76']:.4f}, "
+                f"P62={summary['best_so_far_P62']:.4f}, "
+                f"P79={summary['best_so_far_P79']:.4f}, "
+                f"P89={summary['best_so_far_P89']:.4f}"
             )
 
     final_front = fronts[0]
@@ -326,45 +364,50 @@ def train_surrogate_models(
     dataset: pd.DataFrame,
     feature_columns: list[str],
     random_state: int,
-) -> tuple[RandomForestRegressor, RandomForestRegressor, dict[str, float], pd.DataFrame]:
+) -> tuple[RandomForestRegressor, RandomForestRegressor, RandomForestRegressor, RandomForestRegressor, dict[str, float], pd.DataFrame]:
     features = dataset[feature_columns].to_numpy(dtype=float)
     current_target = dataset[CURRENT_TARGET].to_numpy(dtype=float)
     loss_target = dataset[LOSS_TARGET].to_numpy(dtype=float)
+    fuel_out_target = dataset[FUEL_OUT_TARGET].to_numpy(dtype=float)
+    efficiency_target = dataset[EFFICIENCY_TARGET].to_numpy(dtype=float)
 
-    (
-        x_train,
-        x_test,
-        current_train,
-        current_test,
-        loss_train,
-        loss_test,
-    ) = train_test_split(
+    split = train_test_split(
         features,
         current_target,
         loss_target,
+        fuel_out_target,
+        efficiency_target,
         test_size=0.2,
         random_state=random_state,
     )
+    x_train, x_test = split[0], split[1]
+    current_train, current_test = split[2], split[3]
+    loss_train, loss_test = split[4], split[5]
+    fuel_out_train, fuel_out_test = split[6], split[7]
+    efficiency_train, efficiency_test = split[8], split[9]
 
-    model_kwargs = {
-        "n_estimators": 400,
-        "random_state": random_state,
-        "n_jobs": -1,
-        "min_samples_leaf": 1,
-    }
-
-    current_model = RandomForestRegressor(**model_kwargs)
-    loss_model = RandomForestRegressor(**model_kwargs)
+    current_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
+    loss_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
+    fuel_out_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
+    efficiency_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
     current_model.fit(x_train, current_train)
     loss_model.fit(x_train, loss_train)
+    fuel_out_model.fit(x_train, fuel_out_train)
+    efficiency_model.fit(x_train, efficiency_train)
 
     current_pred = current_model.predict(x_test)
     loss_pred = loss_model.predict(x_test)
+    fuel_out_pred = fuel_out_model.predict(x_test)
+    efficiency_pred = efficiency_model.predict(x_test)
     metrics = {
         "current_r2": r2_score(current_test, current_pred),
         "current_mae": mean_absolute_error(current_test, current_pred),
         "loss_r2": r2_score(loss_test, loss_pred),
         "loss_mae": mean_absolute_error(loss_test, loss_pred),
+        "fuel_out_r2": r2_score(fuel_out_test, fuel_out_pred),
+        "fuel_out_mae": mean_absolute_error(fuel_out_test, fuel_out_pred),
+        "efficiency_r2": r2_score(efficiency_test, efficiency_pred),
+        "efficiency_mae": mean_absolute_error(efficiency_test, efficiency_pred),
     }
     accuracy_frame = pd.DataFrame(
         {
@@ -372,12 +415,18 @@ def train_surrogate_models(
             "predicted_P76": current_pred,
             "actual_P62": loss_test,
             "predicted_P62": loss_pred,
+            "actual_P79": fuel_out_test,
+            "predicted_P79": fuel_out_pred,
+            "actual_P89": efficiency_test,
+            "predicted_P89": efficiency_pred,
         }
     )
 
     current_model.fit(features, current_target)
     loss_model.fit(features, loss_target)
-    return current_model, loss_model, metrics, accuracy_frame
+    fuel_out_model.fit(features, fuel_out_target)
+    efficiency_model.fit(features, efficiency_target)
+    return current_model, loss_model, fuel_out_model, efficiency_model, metrics, accuracy_frame
 
 
 def dataset_pareto_front(dataset: pd.DataFrame) -> pd.DataFrame:
@@ -385,16 +434,24 @@ def dataset_pareto_front(dataset: pd.DataFrame) -> pd.DataFrame:
     pareto_mask = np.ones(len(candidates), dtype=bool)
     current_values = candidates[CURRENT_TARGET].to_numpy(dtype=float)
     loss_values = candidates[LOSS_TARGET].to_numpy(dtype=float)
+    fuel_out_values = candidates[FUEL_OUT_TARGET].to_numpy(dtype=float)
+    efficiency_values = candidates[EFFICIENCY_TARGET].to_numpy(dtype=float)
 
     for index in range(len(candidates)):
-        dominating = (
+        # no_worse: P76 >=, P62 <=, P79 <=, P89 >=
+        no_worse = (
             (current_values >= current_values[index])
             & (loss_values <= loss_values[index])
-            & (
-                (current_values > current_values[index])
-                | (loss_values < loss_values[index])
-            )
+            & (fuel_out_values <= fuel_out_values[index])
+            & (efficiency_values >= efficiency_values[index])
         )
+        strictly_better = (
+            (current_values > current_values[index])
+            | (loss_values < loss_values[index])
+            | (fuel_out_values < fuel_out_values[index])
+            | (efficiency_values > efficiency_values[index])
+        )
+        dominating = no_worse & strictly_better
         dominating[index] = False
         if dominating.any():
             pareto_mask[index] = False
@@ -403,21 +460,44 @@ def dataset_pareto_front(dataset: pd.DataFrame) -> pd.DataFrame:
     return front.sort_values([LOSS_TARGET, CURRENT_TARGET], ascending=[True, False]).reset_index(drop=True)
 
 
-def normalized_distance_to_ideal(current_values: np.ndarray, loss_values: np.ndarray) -> np.ndarray:
-    current_span = current_values.max() - current_values.min()
-    loss_span = loss_values.max() - loss_values.min()
-    current_span = current_span if current_span else 1.0
-    loss_span = loss_span if loss_span else 1.0
+def normalized_distance_to_ideal(
+    current_values: np.ndarray,
+    loss_values: np.ndarray,
+    fuel_out_values: np.ndarray | None = None,
+    efficiency_values: np.ndarray | None = None,
+) -> np.ndarray:
+    def _safe_span(arr: np.ndarray) -> float:
+        s = arr.max() - arr.min()
+        return s if s else 1.0
 
-    current_score = (current_values - current_values.min()) / current_span
-    loss_score = (loss_values.max() - loss_values) / loss_span
-    return np.sqrt((1.0 - current_score) ** 2 + (1.0 - loss_score) ** 2)
+    w = OBJECTIVE_WEIGHTS
+
+    # P76: maximize -> score = (val - min) / span
+    current_score = (current_values - current_values.min()) / _safe_span(current_values)
+    # P62: minimize -> score = (max - val) / span
+    loss_score = (loss_values.max() - loss_values) / _safe_span(loss_values)
+
+    dist_sq = w[CURRENT_TARGET] * (1.0 - current_score) ** 2 + w[LOSS_TARGET] * (1.0 - loss_score) ** 2
+
+    if fuel_out_values is not None:
+        # P79: minimize -> score = (max - val) / span
+        fuel_out_score = (fuel_out_values.max() - fuel_out_values) / _safe_span(fuel_out_values)
+        dist_sq += w[FUEL_OUT_TARGET] * (1.0 - fuel_out_score) ** 2
+
+    if efficiency_values is not None:
+        # P89: maximize -> score = (val - min) / span
+        efficiency_score = (efficiency_values - efficiency_values.min()) / _safe_span(efficiency_values)
+        dist_sq += w[EFFICIENCY_TARGET] * (1.0 - efficiency_score) ** 2
+
+    return np.sqrt(dist_sq)
 
 
 def extract_compromise_candidate(front: list[Individual]) -> tuple[Individual, dict[str, float]]:
-    current_values = np.array([individual.predicted_current for individual in front], dtype=float)
-    loss_values = np.array([individual.predicted_losses for individual in front], dtype=float)
-    distances = normalized_distance_to_ideal(current_values, loss_values)
+    current_values = np.array([ind.predicted_current for ind in front], dtype=float)
+    loss_values = np.array([ind.predicted_losses for ind in front], dtype=float)
+    fuel_out_values = np.array([ind.predicted_fuel_out for ind in front], dtype=float)
+    efficiency_values = np.array([ind.predicted_efficiency for ind in front], dtype=float)
+    distances = normalized_distance_to_ideal(current_values, loss_values, fuel_out_values, efficiency_values)
     best_index = int(np.argmin(distances))
 
     summary = {
@@ -425,8 +505,12 @@ def extract_compromise_candidate(front: list[Individual]) -> tuple[Individual, d
         "best_distance_to_ideal": float(distances[best_index]),
         "best_predicted_P76": float(current_values[best_index]),
         "best_predicted_P62": float(loss_values[best_index]),
+        "best_predicted_P79": float(fuel_out_values[best_index]),
+        "best_predicted_P89": float(efficiency_values[best_index]),
         "front_max_P76": float(current_values.max()),
         "front_min_P62": float(loss_values.min()),
+        "front_min_P79": float(fuel_out_values.min()),
+        "front_max_P89": float(efficiency_values.max()),
     }
     return front[best_index].clone(), summary
 
@@ -455,6 +539,8 @@ def attach_nearest_dataset_point(
     enriched["nearest_name"] = nearest_rows["Name"]
     enriched["nearest_dataset_P76"] = nearest_rows[CURRENT_TARGET]
     enriched["nearest_dataset_P62"] = nearest_rows[LOSS_TARGET]
+    enriched["nearest_dataset_P79"] = nearest_rows[FUEL_OUT_TARGET]
+    enriched["nearest_dataset_P89"] = nearest_rows[EFFICIENCY_TARGET]
     enriched["feature_distance_to_dataset"] = nearest_distances
     return enriched
 
@@ -465,14 +551,19 @@ def individuals_to_frame(front: list[Individual], dataset: pd.DataFrame, feature
         row = {column: value for column, value in zip(feature_columns, individual.genes)}
         row["predicted_P76"] = individual.predicted_current
         row["predicted_P62"] = individual.predicted_losses
+        row["predicted_P79"] = individual.predicted_fuel_out
+        row["predicted_P89"] = individual.predicted_efficiency
         row["rank"] = individual.rank
         row["crowding"] = individual.crowding
         data.append(row)
 
-    frame = pd.DataFrame(data).drop_duplicates(subset=feature_columns + ["predicted_P76", "predicted_P62"])
+    pred_cols = ["predicted_P76", "predicted_P62", "predicted_P79", "predicted_P89"]
+    frame = pd.DataFrame(data).drop_duplicates(subset=feature_columns + pred_cols)
     frame["distance_to_ideal"] = normalized_distance_to_ideal(
         frame["predicted_P76"].to_numpy(dtype=float),
         frame["predicted_P62"].to_numpy(dtype=float),
+        frame["predicted_P79"].to_numpy(dtype=float),
+        frame["predicted_P89"].to_numpy(dtype=float),
     )
     frame = frame.sort_values(
         ["distance_to_ideal", "predicted_P62", "predicted_P76"],
@@ -488,6 +579,8 @@ def individual_to_frame(individual: Individual, dataset: pd.DataFrame, feature_c
                 **{column: value for column, value in zip(feature_columns, individual.genes)},
                 "predicted_P76": individual.predicted_current,
                 "predicted_P62": individual.predicted_losses,
+                "predicted_P79": individual.predicted_fuel_out,
+                "predicted_P89": individual.predicted_efficiency,
                 "rank": individual.rank,
                 "crowding": individual.crowding,
             }
@@ -512,29 +605,45 @@ def build_best_solution_frame(
     best_solution["surrogate_P76_MAE"] = metrics["current_mae"]
     best_solution["surrogate_P62_R2"] = metrics["loss_r2"]
     best_solution["surrogate_P62_MAE"] = metrics["loss_mae"]
+    best_solution["surrogate_P79_R2"] = metrics["fuel_out_r2"]
+    best_solution["surrogate_P79_MAE"] = metrics["fuel_out_mae"]
+    best_solution["surrogate_P89_R2"] = metrics["efficiency_r2"]
+    best_solution["surrogate_P89_MAE"] = metrics["efficiency_mae"]
     return best_solution
 
 
 def plot_convergence(history: pd.DataFrame, output_path: Path) -> None:
-    figure, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+    figure, axes = plt.subplots(5, 1, figsize=(10, 18), sharex=True)
 
     axes[0].plot(history["generation"], history["best_so_far_distance_to_ideal"], marker="o", color="#111827", linewidth=2)
-    axes[0].set_title("GA convergence")
+    axes[0].set_title("GA convergence (4-objective)")
     axes[0].set_ylabel("Distance to ideal")
     axes[0].grid(alpha=0.3)
 
     axes[1].plot(history["generation"], history["front_max_P76"], marker="o", color="#2563eb", label="Front max P76")
-    axes[1].plot(history["generation"], history["best_so_far_P76"], marker="s", color="#0f766e", label="Best-so-far compromise P76")
-    axes[1].set_ylabel("P76 [A m^-2]")
+    axes[1].plot(history["generation"], history["best_so_far_P76"], marker="s", color="#0f766e", label="Best-so-far P76")
+    axes[1].set_ylabel("P76 current-density [A m^-2]")
     axes[1].legend()
     axes[1].grid(alpha=0.3)
 
     axes[2].plot(history["generation"], history["front_min_P62"], marker="o", color="#dc2626", label="Front min P62")
-    axes[2].plot(history["generation"], history["best_so_far_P62"], marker="s", color="#7c2d12", label="Best-so-far compromise P62")
-    axes[2].set_xlabel("Generation")
-    axes[2].set_ylabel("P62 [V]")
+    axes[2].plot(history["generation"], history["best_so_far_P62"], marker="s", color="#7c2d12", label="Best-so-far P62")
+    axes[2].set_ylabel("P62 total-losses [V]")
     axes[2].legend()
     axes[2].grid(alpha=0.3)
+
+    axes[3].plot(history["generation"], history["front_min_P79"], marker="o", color="#7c3aed", label="Front min P79")
+    axes[3].plot(history["generation"], history["best_so_far_P79"], marker="s", color="#4c1d95", label="Best-so-far P79")
+    axes[3].set_ylabel("P79 fuel-out-h2")
+    axes[3].legend()
+    axes[3].grid(alpha=0.3)
+
+    axes[4].plot(history["generation"], history["front_max_P89"], marker="o", color="#059669", label="Front max P89")
+    axes[4].plot(history["generation"], history["best_so_far_P89"], marker="s", color="#064e3b", label="Best-so-far P89")
+    axes[4].set_xlabel("Generation")
+    axes[4].set_ylabel("P89 power-efficiency")
+    axes[4].legend()
+    axes[4].grid(alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -542,13 +651,15 @@ def plot_convergence(history: pd.DataFrame, output_path: Path) -> None:
 
 
 def plot_model_accuracy(accuracy_frame: pd.DataFrame, metrics: dict[str, float], output_path: Path) -> None:
-    figure, axes = plt.subplots(1, 2, figsize=(14, 6))
+    figure, axes = plt.subplots(2, 2, figsize=(14, 12))
     plot_specs = [
         ("actual_P76", "predicted_P76", "P76 current-density", metrics["current_r2"], metrics["current_mae"], "#2563eb"),
         ("actual_P62", "predicted_P62", "P62 total-losses", metrics["loss_r2"], metrics["loss_mae"], "#dc2626"),
+        ("actual_P79", "predicted_P79", "P79 fuel-out-h2", metrics["fuel_out_r2"], metrics["fuel_out_mae"], "#7c3aed"),
+        ("actual_P89", "predicted_P89", "P89 power-efficiency", metrics["efficiency_r2"], metrics["efficiency_mae"], "#059669"),
     ]
 
-    for axis, (actual_column, predicted_column, title, r2_value, mae_value, color) in zip(axes, plot_specs):
+    for axis, (actual_column, predicted_column, title, r2_value, mae_value, color) in zip(axes.flat, plot_specs):
         actual = accuracy_frame[actual_column].to_numpy(dtype=float)
         predicted = accuracy_frame[predicted_column].to_numpy(dtype=float)
         low = min(actual.min(), predicted.min())
@@ -567,42 +678,35 @@ def plot_model_accuracy(accuracy_frame: pd.DataFrame, metrics: dict[str, float],
 
 
 def plot_fronts(dataset: pd.DataFrame, dataset_front: pd.DataFrame, ga_front: pd.DataFrame, output_path: Path) -> None:
-    plt.figure(figsize=(10, 7))
-    plt.scatter(
-        dataset[LOSS_TARGET],
-        dataset[CURRENT_TARGET],
-        alpha=0.2,
-        s=35,
-        label="All dataset points",
-        color="#9ca3af",
-    )
-    plt.scatter(
-        dataset_front[LOSS_TARGET],
-        dataset_front[CURRENT_TARGET],
-        s=70,
-        label="Dataset Pareto front",
-        color="#2563eb",
-    )
-    plt.scatter(
-        ga_front["predicted_P62"],
-        ga_front["predicted_P76"],
-        s=70,
-        label="GA Pareto front",
-        color="#dc2626",
-    )
+    # 2x2 pairwise projections of the 4-objective Pareto front
+    pair_specs = [
+        (LOSS_TARGET, CURRENT_TARGET, "predicted_P62", "predicted_P76",
+         "P62 total-losses [V]", "P76 current-density [A m^-2]"),
+        (FUEL_OUT_TARGET, CURRENT_TARGET, "predicted_P79", "predicted_P76",
+         "P79 fuel-out-h2", "P76 current-density [A m^-2]"),
+        (LOSS_TARGET, EFFICIENCY_TARGET, "predicted_P62", "predicted_P89",
+         "P62 total-losses [V]", "P89 power-efficiency"),
+        (FUEL_OUT_TARGET, EFFICIENCY_TARGET, "predicted_P79", "predicted_P89",
+         "P79 fuel-out-h2", "P89 power-efficiency"),
+    ]
 
-    if not ga_front.empty:
-        best = ga_front.iloc[0]
-        plt.scatter(best["predicted_P62"], best["predicted_P76"], s=140, color="#111827", label="GA best compromise")
+    figure, axes = plt.subplots(2, 2, figsize=(16, 14))
+    for axis, (ds_x, ds_y, ga_x, ga_y, xlabel, ylabel) in zip(axes.flat, pair_specs):
+        axis.scatter(dataset[ds_x], dataset[ds_y], alpha=0.2, s=25, color="#9ca3af", label="Dataset")
+        axis.scatter(dataset_front[ds_x], dataset_front[ds_y], s=60, color="#2563eb", label="Dataset Pareto")
+        axis.scatter(ga_front[ga_x], ga_front[ga_y], s=60, color="#dc2626", label="GA Pareto")
+        if not ga_front.empty:
+            best = ga_front.iloc[0]
+            axis.scatter(best[ga_x], best[ga_y], s=140, color="#111827", zorder=5, label="GA best")
+        axis.set_xlabel(xlabel)
+        axis.set_ylabel(ylabel)
+        axis.grid(alpha=0.2)
+        axis.legend(fontsize=8)
 
-    plt.xlabel("P62 total-losses [V]")
-    plt.ylabel("P76 current-density [A m^-2]")
-    plt.title("SOFC Pareto front: raw data vs surrogate-assisted GA")
-    plt.grid(alpha=0.2)
-    plt.legend()
+    figure.suptitle("SOFC 4-objective Pareto front: pairwise projections", fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    plt.close(figure)
 
 
 def parse_args() -> argparse.Namespace:
@@ -672,30 +776,30 @@ def main() -> None:
     accuracy_figure_path = resolve_path(args.accuracy_figure, ROOT_DIR)
 
     dataset = pd.read_csv(dataset_path)
-    required_columns = FEATURE_COLUMNS + [CURRENT_TARGET, LOSS_TARGET, "source_file", "Name"]
+    required_columns = FEATURE_COLUMNS + ALL_TARGETS + ["source_file", "Name"]
     missing_columns = [column for column in required_columns if column not in dataset.columns]
     if missing_columns:
         raise KeyError(f"The dataset is missing required columns: {', '.join(missing_columns)}")
 
-    modeling_dataset = dataset.dropna(subset=FEATURE_COLUMNS + [CURRENT_TARGET, LOSS_TARGET]).copy()
+    modeling_dataset = dataset.dropna(subset=FEATURE_COLUMNS + ALL_TARGETS).copy()
     dropped_rows = len(dataset) - len(modeling_dataset)
     if modeling_dataset.empty:
         raise ValueError("No complete rows are available for GA training and optimization.")
     if dropped_rows:
         print(f"Rows excluded from modeling because of missing values: {dropped_rows}")
 
-    current_model, loss_model, metrics, accuracy_frame = train_surrogate_models(
+    current_model, loss_model, fuel_out_model, efficiency_model, metrics, accuracy_frame = train_surrogate_models(
         dataset=modeling_dataset,
         feature_columns=FEATURE_COLUMNS,
         random_state=args.seed,
     )
 
     print("Surrogate model validation metrics:")
-    print(f"  P76 R2  = {metrics['current_r2']:.4f}")
-    print(f"  P76 MAE = {metrics['current_mae']:.4f}")
-    print(f"  P62 R2  = {metrics['loss_r2']:.4f}")
-    print(f"  P62 MAE = {metrics['loss_mae']:.4f}")
-    print("Decision variables used by the GA: P27, P46, P47, P52")
+    print(f"  P76 R2  = {metrics['current_r2']:.4f},  MAE = {metrics['current_mae']:.4f}")
+    print(f"  P62 R2  = {metrics['loss_r2']:.4f},  MAE = {metrics['loss_mae']:.4f}")
+    print(f"  P79 R2  = {metrics['fuel_out_r2']:.4f},  MAE = {metrics['fuel_out_mae']:.4f}")
+    print(f"  P89 R2  = {metrics['efficiency_r2']:.4f},  MAE = {metrics['efficiency_mae']:.4f}")
+    print(f"Decision variables used by the GA: {', '.join(FEATURE_COLUMNS)}")
 
     feature_space = modeling_dataset[FEATURE_COLUMNS].to_numpy(dtype=float)
     bounds = np.column_stack((feature_space.min(axis=0), feature_space.max(axis=0)))
@@ -704,6 +808,8 @@ def main() -> None:
     front, convergence_history, best_candidate = evolve_population(
         current_model=current_model,
         loss_model=loss_model,
+        fuel_out_model=fuel_out_model,
+        efficiency_model=efficiency_model,
         bounds=bounds,
         seed_points=feature_space,
         population_size=args.population_size,

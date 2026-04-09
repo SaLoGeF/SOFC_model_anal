@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('scripts/sofc_genetic_algorithm.py', doraise=True\\); print\\('OK'\\)\")"
+    ]
+  }
+}
