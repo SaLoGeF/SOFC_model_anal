@@ -10,7 +10,7 @@ import pandas as pd
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 GA_SOLUTION_PATH = ROOT_DIR / "ga_best_solution.csv"
-MODEL_RESULT_PATH = ROOT_DIR / "Best of the best point 2.csv"
+MODEL_RESULT_PATH = ROOT_DIR / "Best of the best point 4.csv"
 
 FEATURE_COLUMNS = ["P27", "P46", "P47", "P52"]
 TARGET_COLUMNS = ["P76", "P62", "P79", "P89"]
