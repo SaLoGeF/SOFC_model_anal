@@ -7,7 +7,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, VotingRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
@@ -29,7 +29,7 @@ ALL_TARGETS = [CURRENT_TARGET, LOSS_TARGET, FUEL_OUT_TARGET, EFFICIENCY_TARGET]
 # P76 (current-density) and P89 (efficiency) are primary performance metrics.
 # P62 (total-losses) and P79 (fuel-out-h2) are secondary.
 OBJECTIVE_WEIGHTS = {
-    CURRENT_TARGET: 0.3,
+    CURRENT_TARGET: 0.4,
     LOSS_TARGET: 0.2,
     FUEL_OUT_TARGET: 0.2,
     EFFICIENCY_TARGET: 0.3,
@@ -191,7 +191,7 @@ def mutate(
 
 def evaluate_genes(
     genes: np.ndarray,
-    current_model: RandomForestRegressor,
+    current_model: VotingRegressor,
     loss_model: RandomForestRegressor,
     fuel_out_model: RandomForestRegressor,
     efficiency_model: RandomForestRegressor,
@@ -211,7 +211,7 @@ def initialize_population(
     bounds: np.ndarray,
     seed_points: np.ndarray,
     rng: np.random.Generator,
-    current_model: RandomForestRegressor,
+    current_model: VotingRegressor,
     loss_model: RandomForestRegressor,
     fuel_out_model: RandomForestRegressor,
     efficiency_model: RandomForestRegressor,
@@ -231,7 +231,7 @@ def initialize_population(
 
 
 def evolve_population(
-    current_model: RandomForestRegressor,
+    current_model: VotingRegressor,
     loss_model: RandomForestRegressor,
     fuel_out_model: RandomForestRegressor,
     efficiency_model: RandomForestRegressor,
@@ -364,9 +364,10 @@ def train_surrogate_models(
     dataset: pd.DataFrame,
     feature_columns: list[str],
     random_state: int,
-) -> tuple[RandomForestRegressor, RandomForestRegressor, RandomForestRegressor, RandomForestRegressor, dict[str, float], pd.DataFrame]:
+) -> tuple[VotingRegressor, RandomForestRegressor, RandomForestRegressor, RandomForestRegressor, dict[str, float], pd.DataFrame]:
     features = dataset[feature_columns].to_numpy(dtype=float)
-    current_target = dataset[CURRENT_TARGET].to_numpy(dtype=float)
+    # Clip tiny negative P76 values (numerical noise near zero OCV point)
+    current_target = np.clip(dataset[CURRENT_TARGET].to_numpy(dtype=float), 0.0, None)
     loss_target = dataset[LOSS_TARGET].to_numpy(dtype=float)
     fuel_out_target = dataset[FUEL_OUT_TARGET].to_numpy(dtype=float)
     efficiency_target = dataset[EFFICIENCY_TARGET].to_numpy(dtype=float)
@@ -386,10 +387,20 @@ def train_surrogate_models(
     fuel_out_train, fuel_out_test = split[6], split[7]
     efficiency_train, efficiency_test = split[8], split[9]
 
-    current_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
-    loss_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
-    fuel_out_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
-    efficiency_model = RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
+    rf_params: dict = dict(n_estimators=400, random_state=random_state, n_jobs=-1, min_samples_leaf=1)
+
+    # P76: ensemble of RF + GBR reduces MAE on extreme points while keeping R2 high
+    current_model = VotingRegressor(
+        estimators=[
+            ("rf", RandomForestRegressor(n_estimators=1000, random_state=random_state, n_jobs=-1, min_samples_leaf=3)),
+            ("gbr", GradientBoostingRegressor(n_estimators=1000, max_depth=6, learning_rate=0.05, random_state=random_state, subsample=0.8)),
+        ],
+        weights=[2, 1],
+    )
+    loss_model = RandomForestRegressor(**rf_params)
+    fuel_out_model = RandomForestRegressor(**rf_params)
+    efficiency_model = RandomForestRegressor(**rf_params)
+
     current_model.fit(x_train, current_train)
     loss_model.fit(x_train, loss_train)
     fuel_out_model.fit(x_train, fuel_out_train)

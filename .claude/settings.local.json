@@ -3,7 +3,9 @@
     "allow": [
       "Bash(python -c ':*)",
       "Bash(pip install:*)",
-      "Bash(python -c \"import py_compile; py_compile.compile\\('scripts/sofc_genetic_algorithm.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\('scripts/sofc_genetic_algorithm.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python scripts/build_unified_dataset.py)",
+      "Bash(python scripts/sofc_genetic_algorithm.py)"
     ]
   }
 }

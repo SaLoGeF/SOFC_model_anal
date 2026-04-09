@@ -61,7 +61,7 @@ def read_model_csv(path: Path) -> pd.DataFrame:
     frame.insert(0, "source_file", path.name)
     frame.insert(1, "source_stem", path.stem)
     frame.insert(2, "run_timestamp", extract_timestamp(comment_lines))
-    frame.insert(4, "dp_index", frame["Name"].str.extract(r"(\d+)").astype("Int64"))
+    frame.insert(4, "dp_index", frame["Name"].str.extract(r"(\d+)").iloc[:, 0].astype("Int64"))
 
     return frame
 
@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=ROOT_DIR,
+        default=ROOT_DIR / "Dataset",
         help="Directory that contains the raw model CSV files.",
     )
     parser.add_argument(

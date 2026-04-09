@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -41,7 +42,7 @@ def print_top_correlations(correlation: pd.DataFrame, target: str, top_n: int = 
     print()
 
 
-def build_heatmap(dataset_path: Path, output_path: Path, columns: list[str] | None, method: str) -> None:
+def build_heatmap(dataset_path: Path, output_path: Path, columns: list[str] | None, method: Literal["pearson", "kendall", "spearman"]) -> None:
     frame = pd.read_csv(dataset_path)
     selected = select_columns(frame, columns)
     correlation = selected.corr(method=method)
