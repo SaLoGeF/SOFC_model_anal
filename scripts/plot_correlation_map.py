@@ -4,10 +4,23 @@ import argparse
 from pathlib import Path
 from typing import Literal
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "mathtext.fontset": "cm",
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "figure.dpi": 150,
+    "axes.linewidth": 0.8,
+})
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -50,7 +63,7 @@ def build_heatmap(dataset_path: Path, output_path: Path, columns: list[str] | No
     if correlation.empty:
         raise ValueError("No numeric columns are available for the correlation map.")
 
-    figure_scale = max(12, min(26, int(len(correlation.columns) * 0.7)))
+    figure_scale = max(10, min(22, int(len(correlation.columns) * 0.6)))
     annotate = len(correlation.columns) <= 12
     mask = np.triu(np.ones_like(correlation, dtype=bool))
 
@@ -69,7 +82,7 @@ def build_heatmap(dataset_path: Path, output_path: Path, columns: list[str] | No
         fmt=".2f",
         cbar_kws={"shrink": 0.8},
     )
-    plt.title(f"SOFC correlation heatmap ({method})")
+    plt.title(f"Корреляционная матрица ТОЭ ({method})")
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
