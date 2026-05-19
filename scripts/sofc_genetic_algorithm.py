@@ -4,12 +4,36 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator
+
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "mathtext.fontset": "cm",
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "figure.dpi": 150,
+    "axes.linewidth": 0.8,
+    "xtick.major.width": 0.6,
+    "ytick.major.width": 0.6,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.top": True,
+    "ytick.right": True,
+})
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, VotingRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import FunctionTransformer, PolynomialFeatures
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -24,6 +48,7 @@ DEFAULT_OUTPUT = ROOT_DIR / "ga_best_solution.csv"
 DEFAULT_HISTORY_OUTPUT = ROOT_DIR / "ga_convergence_history.csv"
 DEFAULT_CONVERGENCE_FIGURE = ROOT_DIR / "ga_convergence.png"
 DEFAULT_ACCURACY_FIGURE = ROOT_DIR / "ga_model_accuracy.png"
+DEFAULT_PARETO_FIGURE = ROOT_DIR / "ga_pareto_front.png"
 
 # --- Входные / целевые переменные -------------------------------------------
 FEATURE_COLUMNS = ["P27", "P46", "P47", "P52"]
@@ -43,19 +68,21 @@ GA_MUTATION_SCALE = 0.08      # σ мутации как доля диапазо
 GA_SEED = 42
 
 # --- Параметры суррогатных ML-моделей ---------------------------------------
-ML_TEST_SIZE = 0.2            # доля тестовой выборки
+ML_TEST_SIZE = 0.2            # доля тестовой выборки (for accuracy plot)
+ML_CV_FOLDS = 5               # кросс-валидация для метрик
+ML_POLY_DEGREE = 2            # степень полиномиального расширения признаков
 
 # P76: ансамбль RF + GBR (VotingRegressor)
-ML_P76_RF_N_ESTIMATORS = 1000
-ML_P76_RF_MIN_SAMPLES_LEAF = 3
-ML_P76_GBR_N_ESTIMATORS = 1000
-ML_P76_GBR_MAX_DEPTH = 6
-ML_P76_GBR_LEARNING_RATE = 0.05
+ML_P76_RF_N_ESTIMATORS = 1500
+ML_P76_RF_MIN_SAMPLES_LEAF = 2
+ML_P76_GBR_N_ESTIMATORS = 2000
+ML_P76_GBR_MAX_DEPTH = 8
+ML_P76_GBR_LEARNING_RATE = 0.03
 ML_P76_GBR_SUBSAMPLE = 0.8
-ML_P76_VOTING_WEIGHTS = [2, 1]  # [RF, GBR]
+ML_P76_VOTING_WEIGHTS = [1, 2]  # [RF, GBR]
 
 # P62, P79, P89: RandomForest
-ML_RF_N_ESTIMATORS = 400
+ML_RF_N_ESTIMATORS = 800
 ML_RF_MIN_SAMPLES_LEAF = 1
 
 # ---------------------------------------------------------------------------
@@ -83,6 +110,12 @@ OBJECTIVE_WEIGHTS = {
 }
 
 # ===========================================================================
+
+
+def _add_reciprocal_p27(X: np.ndarray) -> np.ndarray:
+    """Append 1/P27 (first column) — captures exponential P76 growth at low P27."""
+    reciprocal = 1.0 / np.clip(X[:, 0], 0.01, None)
+    return np.column_stack([X, reciprocal])
 
 
 @dataclass
@@ -240,10 +273,10 @@ def mutate(
 
 def evaluate_genes(
     genes: np.ndarray,
-    current_model: VotingRegressor,
-    loss_model: RandomForestRegressor,
-    fuel_out_model: RandomForestRegressor,
-    efficiency_model: RandomForestRegressor,
+    current_model: BaseEstimator,
+    loss_model: BaseEstimator,
+    fuel_out_model: BaseEstimator,
+    efficiency_model: BaseEstimator,
 ) -> Individual:
     row = genes.reshape(1, -1)
     return Individual(
@@ -260,10 +293,10 @@ def initialize_population(
     bounds: np.ndarray,
     seed_points: np.ndarray,
     rng: np.random.Generator,
-    current_model: VotingRegressor,
-    loss_model: RandomForestRegressor,
-    fuel_out_model: RandomForestRegressor,
-    efficiency_model: RandomForestRegressor,
+    current_model: BaseEstimator,
+    loss_model: BaseEstimator,
+    fuel_out_model: BaseEstimator,
+    efficiency_model: BaseEstimator,
 ) -> list[Individual]:
     population: list[Individual] = []
     shuffled_indices = rng.permutation(len(seed_points))
@@ -280,10 +313,10 @@ def initialize_population(
 
 
 def evolve_population(
-    current_model: VotingRegressor,
-    loss_model: RandomForestRegressor,
-    fuel_out_model: RandomForestRegressor,
-    efficiency_model: RandomForestRegressor,
+    current_model: BaseEstimator,
+    loss_model: BaseEstimator,
+    fuel_out_model: BaseEstimator,
+    efficiency_model: BaseEstimator,
     bounds: np.ndarray,
     seed_points: np.ndarray,
     population_size: int,
@@ -413,7 +446,7 @@ def train_surrogate_models(
     dataset: pd.DataFrame,
     feature_columns: list[str],
     random_state: int,
-) -> tuple[VotingRegressor, RandomForestRegressor, RandomForestRegressor, RandomForestRegressor, dict[str, float], pd.DataFrame]:
+) -> tuple[BaseEstimator, BaseEstimator, BaseEstimator, BaseEstimator, dict[str, float], pd.DataFrame]:
     features = dataset[feature_columns].to_numpy(dtype=float)
     # Clip tiny negative P76 values (numerical noise near zero OCV point)
     current_target = np.clip(dataset[CURRENT_TARGET].to_numpy(dtype=float), 0.0, None)
@@ -421,67 +454,63 @@ def train_surrogate_models(
     fuel_out_target = dataset[FUEL_OUT_TARGET].to_numpy(dtype=float)
     efficiency_target = dataset[EFFICIENCY_TARGET].to_numpy(dtype=float)
 
-    split = train_test_split(
-        features,
-        current_target,
-        loss_target,
-        fuel_out_target,
-        efficiency_target,
-        test_size=ML_TEST_SIZE,
-        random_state=random_state,
-    )
-    x_train, x_test = split[0], split[1]
-    current_train, current_test = split[2], split[3]
-    loss_train, loss_test = split[4], split[5]
-    fuel_out_train, fuel_out_test = split[6], split[7]
-    efficiency_train, efficiency_test = split[8], split[9]
-
     rf_params: dict = dict(n_estimators=ML_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_RF_MIN_SAMPLES_LEAF)
+    reciprocal = FunctionTransformer(_add_reciprocal_p27)
 
-    # P76: ensemble of RF + GBR reduces MAE on extreme points while keeping R2 high
-    current_model = VotingRegressor(
-        estimators=[
-            ("rf", RandomForestRegressor(n_estimators=ML_P76_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_P76_RF_MIN_SAMPLES_LEAF)),
-            ("gbr", GradientBoostingRegressor(n_estimators=ML_P76_GBR_N_ESTIMATORS, max_depth=ML_P76_GBR_MAX_DEPTH, learning_rate=ML_P76_GBR_LEARNING_RATE, random_state=random_state, subsample=ML_P76_GBR_SUBSAMPLE)),
-        ],
-        weights=ML_P76_VOTING_WEIGHTS,
+    # P76: Pipeline(1/P27 → PolyFeatures → VotingRegressor) + log1p target transform
+    # log1p нормализует огромный диапазон P76 (0 … 21 000), делая обучение стабильнее
+    current_model = TransformedTargetRegressor(
+        regressor=make_pipeline(
+            FunctionTransformer(_add_reciprocal_p27),
+            PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False),
+            VotingRegressor(
+                estimators=[
+                    ("rf", RandomForestRegressor(n_estimators=ML_P76_RF_N_ESTIMATORS, random_state=random_state, n_jobs=-1, min_samples_leaf=ML_P76_RF_MIN_SAMPLES_LEAF)),
+                    ("gbr", GradientBoostingRegressor(n_estimators=ML_P76_GBR_N_ESTIMATORS, max_depth=ML_P76_GBR_MAX_DEPTH, learning_rate=ML_P76_GBR_LEARNING_RATE, random_state=random_state, subsample=ML_P76_GBR_SUBSAMPLE)),
+                ],
+                weights=ML_P76_VOTING_WEIGHTS,
+            ),
+        ),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    loss_model = RandomForestRegressor(**rf_params)
-    fuel_out_model = RandomForestRegressor(**rf_params)
-    efficiency_model = RandomForestRegressor(**rf_params)
 
-    current_model.fit(x_train, current_train)
-    loss_model.fit(x_train, loss_train)
-    fuel_out_model.fit(x_train, fuel_out_train)
-    efficiency_model.fit(x_train, efficiency_train)
+    # P62, P79, P89: Pipeline(1/P27 → PolyFeatures → RandomForest)
+    loss_model = make_pipeline(FunctionTransformer(_add_reciprocal_p27), PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False), RandomForestRegressor(**rf_params))
+    fuel_out_model = make_pipeline(FunctionTransformer(_add_reciprocal_p27), PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False), RandomForestRegressor(**rf_params))
+    efficiency_model = make_pipeline(FunctionTransformer(_add_reciprocal_p27), PolynomialFeatures(degree=ML_POLY_DEGREE, include_bias=False), RandomForestRegressor(**rf_params))
 
-    current_pred = current_model.predict(x_test)
-    loss_pred = loss_model.predict(x_test)
-    fuel_out_pred = fuel_out_model.predict(x_test)
-    efficiency_pred = efficiency_model.predict(x_test)
+    # Кросс-валидация: каждая точка предсказывается моделью, не видевшей её — стабильнее для 197 строк
+    cv = KFold(n_splits=ML_CV_FOLDS, shuffle=True, random_state=random_state)
+    current_pred_cv = cross_val_predict(current_model, features, current_target, cv=cv)
+    loss_pred_cv = cross_val_predict(loss_model, features, loss_target, cv=cv)
+    fuel_out_pred_cv = cross_val_predict(fuel_out_model, features, fuel_out_target, cv=cv)
+    efficiency_pred_cv = cross_val_predict(efficiency_model, features, efficiency_target, cv=cv)
+
     metrics = {
-        "current_r2": r2_score(current_test, current_pred),
-        "current_mae": mean_absolute_error(current_test, current_pred),
-        "loss_r2": r2_score(loss_test, loss_pred),
-        "loss_mae": mean_absolute_error(loss_test, loss_pred),
-        "fuel_out_r2": r2_score(fuel_out_test, fuel_out_pred),
-        "fuel_out_mae": mean_absolute_error(fuel_out_test, fuel_out_pred),
-        "efficiency_r2": r2_score(efficiency_test, efficiency_pred),
-        "efficiency_mae": mean_absolute_error(efficiency_test, efficiency_pred),
+        "current_r2": r2_score(current_target, current_pred_cv),
+        "current_mae": mean_absolute_error(current_target, current_pred_cv),
+        "loss_r2": r2_score(loss_target, loss_pred_cv),
+        "loss_mae": mean_absolute_error(loss_target, loss_pred_cv),
+        "fuel_out_r2": r2_score(fuel_out_target, fuel_out_pred_cv),
+        "fuel_out_mae": mean_absolute_error(fuel_out_target, fuel_out_pred_cv),
+        "efficiency_r2": r2_score(efficiency_target, efficiency_pred_cv),
+        "efficiency_mae": mean_absolute_error(efficiency_target, efficiency_pred_cv),
     }
     accuracy_frame = pd.DataFrame(
         {
-            "actual_P76": current_test,
-            "predicted_P76": current_pred,
-            "actual_P62": loss_test,
-            "predicted_P62": loss_pred,
-            "actual_P79": fuel_out_test,
-            "predicted_P79": fuel_out_pred,
-            "actual_P89": efficiency_test,
-            "predicted_P89": efficiency_pred,
+            "actual_P76": current_target,
+            "predicted_P76": current_pred_cv,
+            "actual_P62": loss_target,
+            "predicted_P62": loss_pred_cv,
+            "actual_P79": fuel_out_target,
+            "predicted_P79": fuel_out_pred_cv,
+            "actual_P89": efficiency_target,
+            "predicted_P89": efficiency_pred_cv,
         }
     )
 
+    # Финальное обучение на всех данных для использования в ГА
     current_model.fit(features, current_target)
     loss_model.fit(features, loss_target)
     fuel_out_model.fit(features, fuel_out_target)
@@ -673,50 +702,57 @@ def build_best_solution_frame(
 
 
 def plot_convergence(history: pd.DataFrame, output_path: Path) -> None:
-    figure, axes = plt.subplots(5, 1, figsize=(10, 18), sharex=True)
+    figure, axes = plt.subplots(5, 1, figsize=(7, 11), sharex=True)
+    gen = history["generation"]
+    ms = 3.5
+    lw = 1.4
 
-    axes[0].plot(history["generation"], history["best_so_far_distance_to_ideal"], marker="o", color="#111827", linewidth=2)
-    axes[0].set_title("GA convergence (4-objective)")
-    axes[0].set_ylabel("Distance to ideal")
-    axes[0].grid(alpha=0.3)
+    axes[0].plot(gen, history["best_so_far_distance_to_ideal"], marker="o", ms=ms, color="#333333", lw=lw)
+    axes[0].set_ylabel("Расстояние до \nидеальной точки")
+    axes[0].grid(alpha=0.2, lw=0.5)
+    axes[0].set_title("а)", loc="left", fontweight="bold", fontsize=10)
 
-    axes[1].plot(history["generation"], history["front_max_P76"], marker="o", color="#2563eb", label="Front max P76")
-    axes[1].plot(history["generation"], history["best_so_far_P76"], marker="s", color="#0f766e", label="Best-so-far P76")
-    axes[1].set_ylabel("P76 current-density [A m^-2]")
-    axes[1].legend()
-    axes[1].grid(alpha=0.3)
+    axes[1].plot(gen, history["front_max_P76"], marker="^", ms=ms, color="#1f77b4", lw=lw, label="Макс. фронта")
+    axes[1].plot(gen, history["best_so_far_P76"], marker="s", ms=ms, color="#2ca02c", lw=lw, label="Лучшее")
+    axes[1].set_ylabel("Плотность тока\n[А$\cdot$м$^{-2}$]")
+    axes[1].legend(loc="lower right", framealpha=0.9, edgecolor="#cccccc")
+    axes[1].grid(alpha=0.2, lw=0.5)
+    axes[1].set_title("б)", loc="left", fontweight="bold", fontsize=10)
 
-    axes[2].plot(history["generation"], history["front_min_P62"], marker="o", color="#dc2626", label="Front min P62")
-    axes[2].plot(history["generation"], history["best_so_far_P62"], marker="s", color="#7c2d12", label="Best-so-far P62")
-    axes[2].set_ylabel("P62 total-losses [V]")
-    axes[2].legend()
-    axes[2].grid(alpha=0.3)
+    axes[2].plot(gen, history["front_min_P62"], marker="v", ms=ms, color="#d62728", lw=lw, label="Мин. фронта")
+    axes[2].plot(gen, history["best_so_far_P62"], marker="s", ms=ms, color="#8c564b", lw=lw, label="Лучшее")
+    axes[2].set_ylabel("Суммарные\nпотери [В]")
+    axes[2].legend(loc="upper right", framealpha=0.9, edgecolor="#cccccc")
+    axes[2].grid(alpha=0.2, lw=0.5)
+    axes[2].set_title("в)", loc="left", fontweight="bold", fontsize=10)
 
-    axes[3].plot(history["generation"], history["front_min_P79"], marker="o", color="#7c3aed", label="Front min P79")
-    axes[3].plot(history["generation"], history["best_so_far_P79"], marker="s", color="#4c1d95", label="Best-so-far P79")
-    axes[3].set_ylabel("P79 fuel-out-h2")
-    axes[3].legend()
-    axes[3].grid(alpha=0.3)
+    axes[3].plot(gen, history["front_min_P79"], marker="D", ms=ms, color="#9467bd", lw=lw, label="Мин. фронта")
+    axes[3].plot(gen, history["best_so_far_P79"], marker="s", ms=ms, color="#7b4173", lw=lw, label="Лучшее")
+    axes[3].set_ylabel("$H_2$ на выходе")
+    axes[3].legend(loc="upper right", framealpha=0.9, edgecolor="#cccccc")
+    axes[3].grid(alpha=0.2, lw=0.5)
+    axes[3].set_title("г)", loc="left", fontweight="bold", fontsize=10)
 
-    axes[4].plot(history["generation"], history["front_max_P89"], marker="o", color="#059669", label="Front max P89")
-    axes[4].plot(history["generation"], history["best_so_far_P89"], marker="s", color="#064e3b", label="Best-so-far P89")
-    axes[4].set_xlabel("Generation")
-    axes[4].set_ylabel("P89 power-efficiency")
-    axes[4].legend()
-    axes[4].grid(alpha=0.3)
+    axes[4].plot(gen, history["front_max_P89"], marker="^", ms=ms, color="#17becf", lw=lw, label="Макс. фронта")
+    axes[4].plot(gen, history["best_so_far_P89"], marker="s", ms=ms, color="#1a9850", lw=lw, label="Лучшее")
+    axes[4].set_xlabel("Поколение")
+    axes[4].set_ylabel("КПД")
+    axes[4].legend(loc="lower right", framealpha=0.9, edgecolor="#cccccc")
+    axes[4].grid(alpha=0.2, lw=0.5)
+    axes[4].set_title("д)", loc="left", fontweight="bold", fontsize=10)
 
-    plt.tight_layout()
+    plt.tight_layout(h_pad=0.4)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(figure)
 
 
 def plot_model_accuracy(accuracy_frame: pd.DataFrame, metrics: dict[str, float], output_path: Path) -> None:
-    figure, axes = plt.subplots(2, 2, figsize=(14, 12))
+    figure, axes = plt.subplots(2, 2, figsize=(8, 7.5))
     plot_specs = [
-        ("actual_P76", "predicted_P76", "P76 current-density", metrics["current_r2"], metrics["current_mae"], "#2563eb"),
-        ("actual_P62", "predicted_P62", "P62 total-losses", metrics["loss_r2"], metrics["loss_mae"], "#dc2626"),
-        ("actual_P79", "predicted_P79", "P79 fuel-out-h2", metrics["fuel_out_r2"], metrics["fuel_out_mae"], "#7c3aed"),
-        ("actual_P89", "predicted_P89", "P89 power-efficiency", metrics["efficiency_r2"], metrics["efficiency_mae"], "#059669"),
+        ("actual_P76", "predicted_P76", "а) Плотность тока (P76)", metrics["current_r2"], metrics["current_mae"], "#1f77b4"),
+        ("actual_P62", "predicted_P62", "б) Сумм. потери (P62)", metrics["loss_r2"], metrics["loss_mae"], "#d62728"),
+        ("actual_P79", "predicted_P79", "в) $H_2$ на выходе (P79)", metrics["fuel_out_r2"], metrics["fuel_out_mae"], "#9467bd"),
+        ("actual_P89", "predicted_P89", "г) КПД (P89)", metrics["efficiency_r2"], metrics["efficiency_mae"], "#2ca02c"),
     ]
 
     for axis, (actual_column, predicted_column, title, r2_value, mae_value, color) in zip(axes.flat, plot_specs):
@@ -724,47 +760,56 @@ def plot_model_accuracy(accuracy_frame: pd.DataFrame, metrics: dict[str, float],
         predicted = accuracy_frame[predicted_column].to_numpy(dtype=float)
         low = min(actual.min(), predicted.min())
         high = max(actual.max(), predicted.max())
+        margin = (high - low) * 0.05
 
-        axis.scatter(actual, predicted, s=50, alpha=0.75, color=color)
-        axis.plot([low, high], [low, high], linestyle="--", color="#111827", linewidth=1.5)
-        axis.set_title(f"{title}\nR2={r2_value:.4f}, MAE={mae_value:.4f}")
-        axis.set_xlabel("Actual")
-        axis.set_ylabel("Predicted")
-        axis.grid(alpha=0.3)
+        axis.scatter(actual, predicted, s=22, alpha=0.65, color=color, edgecolors="#555555", linewidths=0.3, zorder=3)
+        axis.plot([low - margin, high + margin], [low - margin, high + margin], ls="--", color="#333333", lw=1.0, zorder=2)
+        axis.set_xlim(low - margin, high + margin)
+        axis.set_ylim(low - margin, high + margin)
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_title(f"{title}\n$R^2$={r2_value:.4f}, MAE={mae_value:.4f}", fontsize=10, loc="left")
+        axis.set_xlabel("Фактическое значение")
+        axis.set_ylabel("Предсказанное значение")
+        axis.grid(alpha=0.15, lw=0.5, zorder=0)
+        axis.set_axisbelow(True)
 
-    plt.tight_layout()
+    plt.tight_layout(w_pad=1.5, h_pad=1.5)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(figure)
 
 
 def plot_fronts(dataset: pd.DataFrame, dataset_front: pd.DataFrame, ga_front: pd.DataFrame, output_path: Path) -> None:
-    # 2x2 pairwise projections of the 4-objective Pareto front
     pair_specs = [
         (LOSS_TARGET, CURRENT_TARGET, "predicted_P62", "predicted_P76",
-         "P62 total-losses [V]", "P76 current-density [A m^-2]"),
+         "Суммарные потери [В]", "Плотность тока [А$\cdot$м$^{-2}$]"),
         (FUEL_OUT_TARGET, CURRENT_TARGET, "predicted_P79", "predicted_P76",
-         "P79 fuel-out-h2", "P76 current-density [A m^-2]"),
+         "$H_2$ на выходе", "Плотность тока [А$\cdot$м$^{-2}$]"),
         (LOSS_TARGET, EFFICIENCY_TARGET, "predicted_P62", "predicted_P89",
-         "P62 total-losses [V]", "P89 power-efficiency"),
+         "Суммарные потери [В]", "КПД"),
         (FUEL_OUT_TARGET, EFFICIENCY_TARGET, "predicted_P79", "predicted_P89",
-         "P79 fuel-out-h2", "P89 power-efficiency"),
+         "$H_2$ на выходе", "КПД"),
     ]
+    subplot_labels = ["а)", "б)", "в)", "г)"]
 
-    figure, axes = plt.subplots(2, 2, figsize=(16, 14))
-    for axis, (ds_x, ds_y, ga_x, ga_y, xlabel, ylabel) in zip(axes.flat, pair_specs):
-        axis.scatter(dataset[ds_x], dataset[ds_y], alpha=0.2, s=25, color="#9ca3af", label="Dataset")
-        axis.scatter(dataset_front[ds_x], dataset_front[ds_y], s=60, color="#2563eb", label="Dataset Pareto")
-        axis.scatter(ga_front[ga_x], ga_front[ga_y], s=60, color="#dc2626", label="GA Pareto")
+    figure, axes = plt.subplots(2, 2, figsize=(9, 8))
+    for axis, label, (ds_x, ds_y, ga_x, ga_y, xlabel, ylabel) in zip(axes.flat, subplot_labels, pair_specs):
+        axis.scatter(dataset[ds_x], dataset[ds_y], alpha=0.18, s=12, color="#aaaaaa", label="Данные", zorder=1)
+        axis.scatter(dataset_front[ds_x], dataset_front[ds_y], s=35, marker="^", color="#1f77b4",
+                     edgecolors="#555555", linewidths=0.3, label="Парето (данные)", zorder=2)
+        axis.scatter(ga_front[ga_x], ga_front[ga_y], s=35, marker="o", color="#d62728",
+                     edgecolors="#555555", linewidths=0.3, label="Парето (ГА)", zorder=3)
         if not ga_front.empty:
             best = ga_front.iloc[0]
-            axis.scatter(best[ga_x], best[ga_y], s=140, color="#111827", zorder=5, label="GA best")
+            axis.scatter(best[ga_x], best[ga_y], s=90, marker="*", color="#ff7f0e",
+                         edgecolors="#333333", linewidths=0.4, zorder=5, label="Лучшее ГА")
         axis.set_xlabel(xlabel)
         axis.set_ylabel(ylabel)
-        axis.grid(alpha=0.2)
-        axis.legend(fontsize=8)
+        axis.grid(alpha=0.15, lw=0.5, zorder=0)
+        axis.set_axisbelow(True)
+        axis.set_title(label, loc="left", fontweight="bold", fontsize=10)
+        axis.legend(fontsize=7, loc="best", framealpha=0.9, edgecolor="#cccccc")
 
-    figure.suptitle("SOFC 4-objective Pareto front: pairwise projections", fontsize=14)
-    plt.tight_layout()
+    plt.tight_layout(w_pad=1.0, h_pad=1.0)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(figure)
 
@@ -804,6 +849,12 @@ def parse_args() -> argparse.Namespace:
         help="Output image path for the surrogate model accuracy plot.",
     )
     parser.add_argument(
+        "--pareto-figure",
+        type=Path,
+        default=DEFAULT_PARETO_FIGURE,
+        help="Output image path for the Pareto front plot.",
+    )
+    parser.add_argument(
         "--population-size",
         type=int,
         default=GA_POPULATION_SIZE,
@@ -834,6 +885,7 @@ def main() -> None:
     history_output_path = resolve_path(args.history_output, ROOT_DIR)
     convergence_figure_path = resolve_path(args.convergence_figure, ROOT_DIR)
     accuracy_figure_path = resolve_path(args.accuracy_figure, ROOT_DIR)
+    pareto_figure_path = resolve_path(args.pareto_figure, ROOT_DIR)
 
     dataset = pd.read_csv(dataset_path)
     required_columns = FEATURE_COLUMNS + ALL_TARGETS + ["source_file", "Name"]
@@ -897,6 +949,9 @@ def main() -> None:
 
     plot_convergence(convergence_history, convergence_figure_path)
     plot_model_accuracy(accuracy_frame, metrics, accuracy_figure_path)
+
+    ds_front = dataset_pareto_front(modeling_dataset)
+    plot_fronts(modeling_dataset, ds_front, ga_front, pareto_figure_path)
 
     print(f"Best GA solution saved to: {output_path}")
     print(f"GA convergence history saved to: {history_output_path}")

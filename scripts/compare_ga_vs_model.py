@@ -4,26 +4,44 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "mathtext.fontset": "cm",
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "figure.dpi": 150,
+    "axes.linewidth": 0.8,
+    "xtick.major.width": 0.6,
+    "ytick.major.width": 0.6,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+})
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 GA_SOLUTION_PATH = ROOT_DIR / "ga_best_solution.csv"
-MODEL_RESULT_PATH = ROOT_DIR / "Best of the best point 2.csv"
+MODEL_RESULT_PATH = ROOT_DIR / "Best of the best point 4.csv"
 
 FEATURE_COLUMNS = ["P27", "P46", "P47", "P52"]
 TARGET_COLUMNS = ["P76", "P62", "P79", "P89"]
 
 LABELS = {
-    "P27": "cell-voltage [V]",
-    "P46": "air-in-ratio",
-    "P47": "fuel-flow [ml/min]",
-    "P52": "gas-in-t [K]",
-    "P76": "current-density [A m^-2]",
-    "P62": "total-losses [V]",
-    "P79": "fuel-out-h2",
-    "P89": "power-efficiency",
+    "P27": "Напряжение ячейки [В]",
+    "P46": "Коэфф. расхода воздуха",
+    "P47": "Расход топлива [мл/мин]",
+    "P52": "Темп. входного газа [К]",
+    "P76": "Плотность тока [А$\cdot$м$^{-2}$]",
+    "P62": "Суммарные потери [В]",
+    "P79": "$H_2$ на выходе",
+    "P89": "КПД",
 }
 
 OUTPUT_CSV = ROOT_DIR / "ga_vs_model_comparison.csv"
@@ -96,23 +114,25 @@ def plot_comparison(comparison: pd.DataFrame, output_path: Path) -> None:
     """Create a visual comparison of GA predictions vs actual model results."""
     outputs = comparison[comparison["category"] == "output"].copy()
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    colors_ga = "#dc2626"
-    colors_model = "#2563eb"
+    fig, axes = plt.subplots(2, 2, figsize=(8, 6.5))
+    colors_ga = "#d62728"
+    colors_model = "#1f77b4"
+    subplot_labels = ["а)", "б)", "в)", "г)"]
 
-    for ax, (_, row) in zip(axes.flat, outputs.iterrows()):
+    for ax, label, (_, row) in zip(axes.flat, subplot_labels, outputs.iterrows()):
         param = row["parameter"]
         ga_val = row["ga_predicted"]
         model_val = row["model_actual"]
         rel_err = row["rel_error_pct"]
 
         bars = ax.bar(
-            ["GA (surrogate)", "Model (actual)"],
+            ["ГА (суррогат)", "Модель (факт)"],
             [ga_val, model_val],
             color=[colors_ga, colors_model],
-            width=0.5,
-            edgecolor="#111827",
-            linewidth=0.8,
+            width=0.45,
+            edgecolor="#333333",
+            linewidth=0.5,
+            zorder=3,
         )
 
         for bar, val in zip(bars, [ga_val, model_val]):
@@ -122,20 +142,16 @@ def plot_comparison(comparison: pd.DataFrame, output_path: Path) -> None:
                 f"{val:.4f}" if abs(val) < 10 else f"{val:.1f}",
                 ha="center",
                 va="bottom",
-                fontsize=10,
+                fontsize=8,
                 fontweight="bold",
             )
 
-        ax.set_title(f"{param}: {LABELS[param]}\n(rel. error: {rel_err:+.1f}%)", fontsize=11)
+        ax.set_title(f"{label} {param}: {LABELS[param]}\n(отн. ошибка: {rel_err:+.1f}%)", fontsize=10, loc="left")
         ax.set_ylabel(LABELS[param])
-        ax.grid(axis="y", alpha=0.3)
+        ax.grid(axis="y", alpha=0.2, lw=0.5, zorder=0)
+        ax.set_axisbelow(True)
 
-    fig.suptitle(
-        "GA surrogate prediction vs actual model result",
-        fontsize=14,
-        fontweight="bold",
-    )
-    plt.tight_layout()
+    plt.tight_layout(w_pad=1.0, h_pad=1.5)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
